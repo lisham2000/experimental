@@ -16,13 +16,20 @@ Intended long-term design:
 
 from __future__ import annotations
 
+import traceback
 import types
 import typing
 
 from dataclasses import dataclass
 
+from nion.swift import DocumentController
+from nion.swift import Panel
+from nion.swift import Workspace
+from nion.swift.model import PlugInManager
 from nion.typeshed import API_1_0 as Facade
+from nion.ui import Declarative
 from nion.utils import Geometry
+from nion.utils import Stream
 
 
 T = typing.TypeVar("T")
@@ -225,6 +232,746 @@ def get_metadata_source_from_axes_stream(axes_stream: AxesStream) -> str:
     """Return the metadata source used to construct this axes stream."""
 
     return axes_stream.metadata_source
+
+
+# --------------------------------------------------------------------------------------
+# UI and plotting code - consumes AxesStream only
+# --------------------------------------------------------------------------------------
+
+class ExperimentalAxesPlotterHandler(Declarative.Handler):
+    name = "Metadata Axis Plotter"
+
+    def __init__(self, rebuild_widget_fn: typing.Callable[[], None]) -> None:
+        super().__init__()
+
+        api_broker = PlugInManager.APIBroker()
+        facade_api = typing.cast(Facade.API, api_broker.get_api(version="~1.0"))
+        self._api: ApiLike = typing.cast(ApiLike, facade_api)
+
+        self._rebuild_widget_fn = rebuild_widget_fn
+        self._current_display_item: ApiDisplayLike | None = None
+        self._current_axes_stream: AxesStream | None = None
+
+        self.axis_ids: list[str] = []
+
+        self._axis_id_to_axis: dict[str, CoordinateAxis] = {}
+        self._axis_id_to_safeid: dict[str, str] = {}
+        self._safeid_to_axis_id: dict[str, str] = {}
+        self._axis_graphics: dict[AxisGraphicKey, VisibleAxisOverlay] = {}
+        self._axis_toggle_callback_names: set[str] = set()
+
+        self.full_length_enabled = False
+        self.status_text = "Select a display panel containing a data item."
+
+        self._ui = Declarative.DeclarativeUI()
+        self.ui_view = self._build_ui()
+
+        self._axes_stream_stream = self._create_axes_value_stream()
+        self._axes_stream_listener: EventListenerLike | None = (
+            self._axes_stream_stream.value_stream.listen(self._axes_stream_changed)
+        )
+
+    def close(self) -> None:
+        """Declarative widget close.
+
+        Do not remove axis overlays here, otherwise overlays disappear on focus changes.
+        """
+
+        return
+
+    def close_for_panel(self) -> None:
+        """Clean up streams and overlays because the actual panel is closing."""
+
+        if self._axes_stream_listener is not None:
+            try:
+                self._axes_stream_listener.close()
+            except Exception:
+                traceback.print_exc()
+
+            self._axes_stream_listener = None
+
+        self._remove_all_axis_graphics()
+
+    def _create_axes_value_stream(self) -> Stream.ValueStream[AxesStream | None]:
+        """Create the current AxesStream value stream."""
+
+        try:
+            return typing.cast(
+                Stream.ValueStream[AxesStream | None],
+                Stream.ValueStream(None)
+            )
+        except TypeError:
+            axes_stream_stream = typing.cast(
+                Stream.ValueStream[AxesStream | None],
+                Stream.ValueStream()
+            )
+            axes_stream_stream.value = None
+            return axes_stream_stream
+
+    def _set_axes_stream_value(self, axes_stream: AxesStream | None) -> None:
+        """Set the current axes stream and force the UI state to update."""
+
+        try:
+            self._axes_stream_stream.value = axes_stream
+        except Exception:
+            traceback.print_exc()
+
+        self._axes_stream_changed(axes_stream)
+
+    def _axes_stream_changed(self, axes_stream: AxesStream | None) -> None:
+        """Refresh handler state when the current AxesStream changes."""
+
+        self._current_axes_stream = axes_stream
+        self._refresh_axes_from_axes_stream(axes_stream)
+        self._rebuild_ui()
+
+    def set_display_item(self, display_item: ApiDisplayLike | None) -> None:
+        """Update axes from the selected/focused display item."""
+
+        self._current_display_item = display_item
+        self._set_axes_stream_value(self._create_axes_stream_for_current_display_item())
+
+    def refresh_from_current_selection(self) -> None:
+        """Manual fallback refresh using the current display item or API target."""
+
+        self._set_axes_stream_value(self._create_axes_stream_for_current_display_item())
+
+    def _notify_property_changed(self, property_name: str) -> None:
+        try:
+            self.property_changed_event.fire(property_name)
+        except AttributeError:
+            return
+        except Exception:
+            traceback.print_exc()
+
+    def _rebuild_ui(self) -> None:
+        self.ui_view = self._build_ui()
+        self._rebuild_widget_fn()
+
+    def _build_ui(self) -> Declarative.UIDescriptionResult:
+        """Build the Declarative UI description in the original compact style."""
+
+        u = self._ui
+
+        header = u.create_row(
+            u.create_label(text="Axis Plotter", width=220),
+            u.create_push_button(text="Refresh", on_clicked="on_refresh_clicked", width=80),
+            u.create_push_button(text="Clear All", on_clicked="on_clear_all_clicked", width=90),
+            u.create_stretch(),
+            spacing=8
+        )
+
+        options_row = u.create_row(
+            u.create_check_box(
+                text="Full length lines",
+                checked="@binding(full_length_enabled)",
+                tool_tip="Draw each axis as a full line centered on the origin."
+            ),
+            u.create_stretch(),
+            spacing=8
+        )
+
+        if not self.axis_ids:
+            body = u.create_column(
+                u.create_label(text="@binding(status_text)", width=460),
+                spacing=6
+            )
+        else:
+            rows: list[Declarative.UIDescriptionResult] = []
+
+            for axis_id in self.axis_ids:
+                axis = self._axis_id_to_axis[axis_id]
+                safeid = self._axis_id_to_safeid[axis_id]
+
+                color_attr = f"axis_color_{safeid}"
+                toggle_method = f"on_toggle_{safeid}_clicked"
+
+                if not hasattr(self, toggle_method):
+                    setattr(self, toggle_method, self._make_toggle_handler(axis_id))
+                    self._axis_toggle_callback_names.add(toggle_method)
+
+                axis_label = f"{axis.display_name} ({axis.axis_type[0]}, {axis.axis_type[1]})"
+
+                rows.append(
+                    u.create_row(
+                        u.create_label(text=axis_label, width=160),
+                        u.create_push_button(text="Toggle", on_clicked=toggle_method, width=70),
+                        u.create_line_edit(text=f"@binding({color_attr})", width=90),
+                        {"type": "nionswift.color_chooser", "color": f"@binding({color_attr})"},
+                        u.create_stretch(),
+                        spacing=8
+                    )
+                )
+
+            body = u.create_column(
+                u.create_label(text="@binding(status_text)", width=460),
+                *rows,
+                spacing=6
+            )
+
+        return u.create_column(header, options_row, body, spacing=10)
+
+    def _make_toggle_handler(self, axis_id: str) -> typing.Callable[[Declarative.UIWidget], None]:
+        """Create a direct button callback that toggles one axis."""
+
+        def _handler(widget: Declarative.UIWidget) -> None:
+            self._toggle_axis(axis_id)
+
+        return _handler
+
+    def _sanitize_axis_id(self, axis_id: str) -> str:
+        out: list[str] = []
+
+        for ch in axis_id:
+            out.append(ch if ch.isalnum() else "_")
+
+        safe_id = "".join(out)
+
+        if safe_id and safe_id[0].isdigit():
+            safe_id = "_" + safe_id
+
+        return safe_id
+
+    def _clear_axis_color_attributes(self) -> None:
+        for attr_name in list(vars(self)):
+            if attr_name.startswith("axis_color_"):
+                object.__delattr__(self, attr_name)
+
+    def _clear_axis_toggle_callbacks(self) -> None:
+        for callback_name in list(self._axis_toggle_callback_names):
+            if callback_name in self.__dict__:
+                object.__delattr__(self, callback_name)
+
+        self._axis_toggle_callback_names.clear()
+
+    def _get_target_document_window(self) -> ApiDocumentWindowLike | None:
+        windows = self._api.application.document_windows
+
+        if not windows:
+            return None
+
+        for window in windows:
+            if window.target_display is not None:
+                return window
+
+        return windows[0]
+
+    def _get_active_data_item(self) -> ApiDataItemLike | None:
+        window = self._get_target_document_window()
+
+        if window is None:
+            return None
+
+        if window.target_data_item is not None:
+            return window.target_data_item
+
+        if window.target_display is not None:
+            return window.target_display.data_item
+
+        return None
+
+    def _get_data_item_key(self, data_item: ApiDataItemLike) -> str:
+        return str(data_item.uuid)
+
+    def _create_axes_stream_for_current_display_item(self) -> AxesStream | None:
+        if self._current_display_item is not None:
+            return create_axes_stream_from_display_item(self._current_display_item)
+
+        data_item = self._get_active_data_item()
+
+        if data_item is None:
+            return None
+
+        return create_axes_stream_from_data_item(data_item)
+
+    def _get_axes_stream(self) -> AxesStream | None:
+        return self._current_axes_stream
+
+    def _refresh_axes_from_axes_stream(self, axes_stream: AxesStream | None) -> None:
+        """Refresh axis UI state from the current AxesStream.
+
+        This clears current UI axis state, removes stale colour/callback bindings,
+        sorts the axis ids, and repopulates the axis lookup for the current stream.
+        Existing overlay graphics are intentionally preserved.
+        """
+
+        self.axis_ids.clear()
+        self._axis_id_to_axis.clear()
+        self._axis_id_to_safeid.clear()
+        self._safeid_to_axis_id.clear()
+        self._clear_axis_color_attributes()
+        self._clear_axis_toggle_callbacks()
+
+        if axes_stream is None:
+            self.status_text = "Selected display panel has no readable axes metadata."
+            self._notify_property_changed("status_text")
+            return
+
+        axes = get_axes_from_axes_stream(axes_stream)
+        metadata_source = get_metadata_source_from_axes_stream(axes_stream)
+
+        if not axes:
+            self.status_text = "Selected display panel has no readable axes metadata."
+            self._notify_property_changed("status_text")
+            return
+
+        preferred_order = (
+            "tv",
+            "scan",
+            "stageaxis",
+            "stagetiltaxis",
+            "eels",
+            "mc",
+            "postsample",
+            "correctoraxis",
+            "gun"
+        )
+
+        ordered_axis_ids: list[str] = []
+
+        for preferred_axis_id in preferred_order:
+            if preferred_axis_id in axes:
+                ordered_axis_ids.append(preferred_axis_id)
+
+        for axis_id in axes:
+            if axis_id not in ordered_axis_ids:
+                ordered_axis_ids.append(axis_id)
+
+        self.axis_ids[:] = ordered_axis_ids
+
+        for axis_id in self.axis_ids:
+            axis = axes[axis_id]
+            safeid = self._sanitize_axis_id(axis_id)
+
+            self._axis_id_to_axis[axis_id] = axis
+            self._axis_id_to_safeid[axis_id] = safeid
+            self._safeid_to_axis_id[safeid] = axis_id
+
+            setattr(self, f"axis_color_{safeid}", axis.color)
+
+        self.status_text = f"Loaded {len(self.axis_ids)} axes from {metadata_source}."
+        self._notify_property_changed("status_text")
+
+    def _shape_to_height_width(self, shape_value: object) -> tuple[int, int] | None:
+        if isinstance(shape_value, (tuple, list)) and len(shape_value) >= 2:
+            return int(shape_value[-2]), int(shape_value[-1])
+
+        return None
+
+    def _get_active_data_shape(self, data_item: ApiDataItemLike) -> tuple[int, int] | None:
+        return self._shape_to_height_width(data_item.xdata.data_shape)
+
+    def _normalize_vector(self, vector: Geometry.FloatPoint) -> Geometry.FloatPoint:
+        length = float(abs(vector))
+
+        if length <= 1e-12:
+            return Geometry.FloatPoint(y=0.0, x=0.0)
+
+        return Geometry.FloatPoint(y=vector.y / length, x=vector.x / length)
+
+    def _normalize_vector_for_display(self, vector: Geometry.FloatPoint, data_shape: tuple[int, int] | None) -> Geometry.FloatPoint:
+        if data_shape is None:
+            return self._normalize_vector(vector)
+
+        height, width = data_shape
+
+        if height <= 0 or width <= 0:
+            return self._normalize_vector(vector)
+
+        pixel_y = vector.y * height
+        pixel_x = vector.x * width
+        pixel_length = (pixel_y * pixel_y + pixel_x * pixel_x) ** 0.5
+
+        if pixel_length <= 1e-12:
+            return Geometry.FloatPoint(y=0.0, x=0.0)
+
+        scale = float(min(height, width))
+
+        return Geometry.FloatPoint(
+            y=(pixel_y / pixel_length) * (scale / height),
+            x=(pixel_x / pixel_length) * (scale / width)
+        )
+
+    def _clamp_point(self, point: Geometry.FloatPoint) -> Geometry.FloatPoint:
+        return Geometry.FloatPoint(
+            y=min(max(point.y, 0.0), 1.0),
+            x=min(max(point.x, 0.0), 1.0)
+        )
+
+    def _axis_line_points(self, origin: Geometry.FloatPoint, unit_vector: Geometry.FloatPoint, line_length: float, *, forward: bool = True) -> tuple[Geometry.FloatPoint, Geometry.FloatPoint]:
+        """Return start/end points for a forward or backward half-axis line."""
+
+        direction_sign = 1.0 if forward else -1.0
+
+        end = self._clamp_point(
+            Geometry.FloatPoint(
+                y=origin.y + direction_sign * unit_vector.y * line_length,
+                x=origin.x + direction_sign * unit_vector.x * line_length
+            )
+        )
+
+        return origin, end
+
+    def _make_line_region(self, data_item: ApiDataItemLike, start: Geometry.FloatPoint, end: Geometry.FloatPoint, color: str, label: str, *, arrow_at_end: bool = True) -> ApiGraphicLike:
+        """Create and configure one Swift line-region overlay."""
+
+        graphic = data_item.add_line_region(start.y, start.x, end.y, end.x)
+
+        graphic.set_property("label", label)
+        graphic.set_property("stroke_color", color)
+        graphic.set_property("stroke_width", 2.0)
+        graphic.set_property("start_arrow_enabled", False)
+        graphic.set_property("end_arrow_enabled", arrow_at_end)
+
+        return graphic
+
+    def _append_axis_line_region(self, graphics_to_add: list[StoredGraphic], graphics_data_item: ApiDataItemLike, start: Geometry.FloatPoint, end: Geometry.FloatPoint, color: str, label: str, *, arrow_at_end: bool = True) -> None:
+        graphic = self._make_line_region(
+            graphics_data_item,
+            start,
+            end,
+            color,
+            label,
+            arrow_at_end=arrow_at_end
+        )
+        graphics_to_add.append((graphics_data_item, graphic))
+
+    def _show_axis_overlay(self, data_item_key: str, axis: CoordinateAxis, graphics_data_item: ApiDataItemLike, color: str) -> tuple[StoredGraphic, ...] | None:
+        """Create overlay graphics for one axis on one API data item."""
+
+        data_shape = self._get_active_data_shape(graphics_data_item)
+
+        x_unit_vector = self._normalize_vector_for_display(axis.x_vector, data_shape)
+        y_unit_vector = self._normalize_vector_for_display(axis.y_vector, data_shape)
+
+        if abs(x_unit_vector) <= 1e-12 or abs(y_unit_vector) <= 1e-12:
+            self.status_text = f"Cannot plot {axis.display_name}: metadata vector is near zero."
+            self._notify_property_changed("status_text")
+            return None
+
+        line_length = 0.22
+        axis_name_0, axis_name_1 = axis.axis_type
+        graphics_to_add: list[StoredGraphic] = []
+
+        try:
+            x_forward_start, x_forward_end = self._axis_line_points(
+                axis.origin,
+                x_unit_vector,
+                line_length,
+                forward=True
+            )
+            y_forward_start, y_forward_end = self._axis_line_points(
+                axis.origin,
+                y_unit_vector,
+                line_length,
+                forward=True
+            )
+
+            self._append_axis_line_region(
+                graphics_to_add,
+                graphics_data_item,
+                x_forward_start,
+                x_forward_end,
+                color,
+                axis_name_0,
+                arrow_at_end=True
+            )
+            self._append_axis_line_region(
+                graphics_to_add,
+                graphics_data_item,
+                y_forward_start,
+                y_forward_end,
+                color,
+                axis_name_1,
+                arrow_at_end=True
+            )
+
+            if self.full_length_enabled:
+                x_backward_start, x_backward_end = self._axis_line_points(
+                    axis.origin,
+                    x_unit_vector,
+                    line_length,
+                    forward=False
+                )
+                y_backward_start, y_backward_end = self._axis_line_points(
+                    axis.origin,
+                    y_unit_vector,
+                    line_length,
+                    forward=False
+                )
+
+                self._append_axis_line_region(
+                    graphics_to_add,
+                    graphics_data_item,
+                    x_backward_start,
+                    x_backward_end,
+                    color,
+                    "",
+                    arrow_at_end=False
+                )
+                self._append_axis_line_region(
+                    graphics_to_add,
+                    graphics_data_item,
+                    y_backward_start,
+                    y_backward_end,
+                    color,
+                    "",
+                    arrow_at_end=False
+                )
+
+        except Exception:
+            for graphic_data_item, graphic in graphics_to_add:
+                try:
+                    graphic_data_item.remove_region(graphic)
+                except Exception:
+                    traceback.print_exc()
+
+            traceback.print_exc()
+            self.status_text = f"Failed to plot axis {axis.display_name}."
+            self._notify_property_changed("status_text")
+            return None
+
+        return tuple(graphics_to_add)
+
+    def _toggle_axis(self, axis_id: str) -> None:
+        """Toggle one axis overlay on the active API data item.
+
+        The available axis must come from the current AxesStream. Overlay state is
+        keyed by data item and axis id so overlays remain visible when focus moves.
+        """
+
+        axes_stream = self._get_axes_stream()
+
+        if axes_stream is None:
+            self.status_text = "No axes stream available for the selected display panel."
+            self._notify_property_changed("status_text")
+            self._refresh_axes_from_axes_stream(None)
+            self._rebuild_ui()
+            return
+
+        axis = get_axis_from_axes_stream(axes_stream, axis_id)
+
+        if axis is None:
+            self.status_text = f"Axis {axis_id!r} is not available on the selected display panel."
+            self._notify_property_changed("status_text")
+            self._refresh_axes_from_axes_stream(axes_stream)
+            self._rebuild_ui()
+            return
+
+        graphics_data_item = self._get_active_data_item()
+
+        if graphics_data_item is None:
+            self.status_text = "No active API data item available for axis overlay."
+            self._notify_property_changed("status_text")
+            return
+
+        data_item_key = self._get_data_item_key(graphics_data_item)
+        overlay_key: AxisGraphicKey = (data_item_key, axis_id)
+
+        if overlay_key in self._axis_graphics:
+            self._remove_graphics_for_key(overlay_key)
+            self.status_text = f"Removed axis {axis.display_name} from active data item."
+            self._notify_property_changed("status_text")
+            return
+
+        safeid = self._axis_id_to_safeid.get(axis_id, self._sanitize_axis_id(axis_id))
+        color = self.__dict__.get(f"axis_color_{safeid}", axis.color)
+
+        if not isinstance(color, str):
+            color = axis.color
+
+        graphics = self._show_axis_overlay(data_item_key, axis, graphics_data_item, color)
+
+        if graphics is None:
+            return
+
+        self._axis_graphics[overlay_key] = VisibleAxisOverlay(
+            data_item_key=data_item_key,
+            axis_id=axis_id,
+            axis=axis,
+            graphics_data_item=graphics_data_item,
+            color=color,
+            graphics=graphics
+        )
+
+        self.status_text = f"Displayed axis {axis.display_name} on active data item."
+        self._notify_property_changed("status_text")
+
+    def _remove_graphics_for_key(self, overlay_key: AxisGraphicKey) -> None:
+        overlay = self._axis_graphics.pop(overlay_key, None)
+
+        if overlay is None:
+            return
+
+        for data_item, graphic in overlay.graphics:
+            try:
+                data_item.remove_region(graphic)
+            except Exception:
+                traceback.print_exc()
+
+    def _remove_all_axis_graphics(self) -> None:
+        for overlay_key in list(self._axis_graphics.keys()):
+            self._remove_graphics_for_key(overlay_key)
+
+    def _rebuild_existing_axes(self) -> None:
+        """Rebuild all currently visible overlays after display-option changes."""
+
+        overlays = list(self._axis_graphics.values())
+        self._axis_graphics.clear()
+
+        for overlay in overlays:
+            for data_item, graphic in overlay.graphics:
+                try:
+                    data_item.remove_region(graphic)
+                except Exception:
+                    traceback.print_exc()
+
+        for overlay in overlays:
+            graphics = self._show_axis_overlay(
+                overlay.data_item_key,
+                overlay.axis,
+                overlay.graphics_data_item,
+                overlay.color
+            )
+
+            if graphics is None:
+                continue
+
+            overlay_key: AxisGraphicKey = (overlay.data_item_key, overlay.axis_id)
+
+            self._axis_graphics[overlay_key] = VisibleAxisOverlay(
+                data_item_key=overlay.data_item_key,
+                axis_id=overlay.axis_id,
+                axis=overlay.axis,
+                graphics_data_item=overlay.graphics_data_item,
+                color=overlay.color,
+                graphics=graphics
+            )
+
+    # Declarative UI expects on_<name> handlers for direct button callbacks.
+    def on_clear_all_clicked(self, widget: Declarative.UIWidget) -> None:
+        self._remove_all_axis_graphics()
+        self.status_text = "Cleared all axis overlays."
+        self._notify_property_changed("status_text")
+
+    # Declarative UI expects on_<name> handlers for direct button callbacks.
+    def on_refresh_clicked(self, widget: Declarative.UIWidget) -> None:
+        self.refresh_from_current_selection()
+
+
+# --------------------------------------------------------------------------------------
+# Panel registration
+# --------------------------------------------------------------------------------------
+
+class ExperimentalAxesPlotterPanel(Panel.Panel):
+    def __init__(self, document_controller: DocumentController.DocumentController, panel_id: str) -> None:
+        """Create the experimental panel."""
+
+        super().__init__(document_controller, panel_id, PANEL_TITLE)
+
+        self.__document_controller = document_controller
+        self.__display_item_changed_listeners: list[EventListenerLike] = []
+
+        ui = document_controller.ui
+
+        self.__content_column = ui.create_column_widget()
+
+        self.widget = self.__content_column
+
+        self.__handler = ExperimentalAxesPlotterHandler(
+            rebuild_widget_fn=self.__rebuild_widget
+        )
+
+        self.__declarative_widget: Declarative.DeclarativeWidget | None = None
+
+        self.__rebuild_widget()
+        self.__connect_display_selection_listener()
+        self.__load_initial_display_item()
+
+    def __rebuild_widget(self) -> None:
+        self.__content_column.remove_all()
+
+        self.__declarative_widget = Declarative.DeclarativeWidget(
+            self.__document_controller.ui,
+            self.__document_controller.event_loop,
+            self.__handler
+        )
+
+        self.__content_column.add(self.__declarative_widget)
+
+    def __connect_display_selection_listener(self) -> None:
+        focused_listener = self.__document_controller.focused_display_item_changed_event.listen(
+            self.__display_item_changed
+        )
+
+        self.__display_item_changed_listeners.append(focused_listener)
+
+    def __get_current_display_item(self) -> ApiDisplayLike | None:
+        focused_display_item = self.__document_controller.focused_display_item
+
+        if focused_display_item is not None:
+            return typing.cast(ApiDisplayLike, focused_display_item)
+
+        selected_display_item = self.__document_controller.selected_display_item
+
+        if selected_display_item is not None:
+            return typing.cast(ApiDisplayLike, selected_display_item)
+
+        return None
+
+    def __load_initial_display_item(self) -> None:
+        self.__handler.set_display_item(self.__get_current_display_item())
+
+    def __display_item_changed(self, display_item: object | None = None) -> None:
+        current_display_item = self.__get_current_display_item()
+
+        if current_display_item is not None:
+            self.__handler.set_display_item(current_display_item)
+            return
+
+        self.__handler.set_display_item(typing.cast(ApiDisplayLike | None, display_item))
+
+    def close(self) -> None:
+        for listener in self.__display_item_changed_listeners:
+            try:
+                listener.close()
+            except Exception:
+                traceback.print_exc()
+
+        self.__display_item_changed_listeners.clear()
+
+        self.__handler.close_for_panel()
+        super().close()
+
+
+def register_panel() -> None:
+    Workspace.WorkspaceManager().register_panel(
+        ExperimentalAxesPlotterPanel,
+        PANEL_ID,
+        PANEL_TITLE,
+        ["left", "right"],
+        "right",
+        {}
+    )
+
+
+def unregister_panel() -> None:
+    Workspace.WorkspaceManager().unregister_panel(PANEL_ID)
+
+
+class ExperimentalAxesPlotterExtension:
+    extension_id = "nion.extension.experimental_axes_plotter"
+
+    def __init__(self, api_broker: ApiBrokerLike) -> None:
+        """Register the panel."""
+
+        api = typing.cast(Facade.API, api_broker.get_api(version="~1.0"))
+        typing.cast(ApiLike, api)
+
+        register_panel()
+
+    def close(self) -> None:
+        unregister_panel()
 
 
 # --------------------------------------------------------------------------------------
