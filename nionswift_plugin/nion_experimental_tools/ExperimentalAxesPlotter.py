@@ -1,15 +1,14 @@
-"""Standalone metadata-driven experimental Axis Plotter panel.
+"""Metadata-driven experimental Axis Plotter panel.
 
-Intended long-term design:
+Design intent:
 
-    - UI / plotting code consumes an AxesStream only.
-    - AxesStream accessor functions are the only way UI / plotting code reads axes.
-    - Raw metadata navigation is currently temporary and isolated in one section.
-    - The temporary stream construction section can later be replaced by a real
-      stream object supplied directly by metadata / niondata.
+    - UI / plotting code consumes a CoordinateTransforms payload.
+    - Today's payload is built from instrument.axis_transformation_matrices metadata.
+    - The metadata builder section can later be replaced when metadata / niondata
+      supplies CoordinateTransforms directly.
 
     - Select/focus a display panel.
-    - The panel automatically loads axes from that display panel's data item.
+    - The panel automatically loads coordinate transforms from that display panel's data item.
     - Existing overlays on other data items remain visible.
     - Refresh remains as a manual fallback.
 """
@@ -32,122 +31,15 @@ from nion.utils import Geometry
 from nion.utils import Stream
 
 
-T = typing.TypeVar("T")
-
-
-def temporary(reason: str) -> typing.Callable[[T], T]:
-    """Mark an object as temporary without changing runtime behaviour."""
-
-    def decorator(obj: T) -> T:
-        setattr(obj, "__temporary__", True)
-        setattr(obj, "__temporary_reason__", reason)
-        return obj
-
-    return decorator
-
-
 PANEL_ID = "experimental-axis-plotter"
 PANEL_TITLE = "[Experimental] Axis plotter"
 
 AXIS_TRANSFORMATION_MATRICES_METADATA_PATH = "instrument.axis_transformation_matrices"
 
-TEMPORARY_STREAM_REASON = (
-    "Temporary stream construction. Raw metadata navigation and parsing lives "
-    "here until a real AxesStream exists directly in metadata/niondata."
-)
-
 
 # --------------------------------------------------------------------------------------
 # Shared data types
 # --------------------------------------------------------------------------------------
-
-class ApiGraphicLike(typing.Protocol):
-    """Minimal Swift API graphic/region interface used by overlay drawing."""
-
-    def set_property(self, key: str, value: object) -> None:
-        ...
-
-
-class ApiXDataLike(typing.Protocol):
-    """Minimal xdata interface used to obtain the active data shape."""
-
-    @property
-    def data_shape(self) -> typing.Sequence[int]:
-        ...
-
-
-class ApiDataItemLike(typing.Protocol):
-    """Minimal Swift API data-item interface used by the axis plotter.
-
-    uuid:
-        UUID-like Swift facade value used as the overlay dictionary key. T
-    metadata:
-        Metadata mapping used only by the temporary stream-construction layer.
-    xdata:
-        XData facade exposing data_shape for display-vector normalisation.
-    """
-
-    @property
-    def uuid(self) -> object:
-        ...
-
-    @property
-    def metadata(self) -> typing.Mapping[object, object]:
-        ...
-
-    @property
-    def xdata(self) -> ApiXDataLike:
-        ...
-
-    def add_line_region(self, start_y: float, start_x: float, end_y: float, end_x: float) -> ApiGraphicLike:
-        ...
-
-    def remove_region(self, graphic: ApiGraphicLike) -> None:
-        ...
-
-
-class ApiDisplayLike(typing.Protocol):
-    """Minimal Swift API display interface used to find a data item."""
-
-    @property
-    def data_item(self) -> ApiDataItemLike | None:
-        ...
-
-
-class ApiDocumentWindowLike(typing.Protocol):
-    """Minimal Swift API document-window interface used for active display lookup."""
-
-    @property
-    def target_display(self) -> ApiDisplayLike | None:
-        ...
-
-    @property
-    def target_data_item(self) -> ApiDataItemLike | None:
-        ...
-
-
-class ApiApplicationLike(typing.Protocol):
-    """Minimal root application interface exposing document windows."""
-
-    @property
-    def document_windows(self) -> typing.Sequence[ApiDocumentWindowLike]:
-        ...
-
-
-class ApiLike(typing.Protocol):
-    """Minimal root Swift API interface used by this panel."""
-
-    @property
-    def application(self) -> ApiApplicationLike:
-        ...
-
-
-class ApiBrokerLike(typing.Protocol):
-    """Minimal API broker protocol used by the extension entry point."""
-
-    def get_api(self, version: str) -> Facade.API:
-        ...
-
 
 class EventListenerLike(typing.Protocol):
     """Minimal event-listener interface returned by Nion event listen calls."""
@@ -156,13 +48,13 @@ class EventListenerLike(typing.Protocol):
         ...
 
 
-StoredGraphic = tuple[ApiDataItemLike, ApiGraphicLike]
+StoredGraphic = tuple[Facade.DataItem, Facade.Graphic]
 AxisGraphicKey = tuple[str, str]
 
 
 @dataclass(frozen=True)
-class CoordinateAxis:
-    """Parsed coordinate-axis data used by the UI and overlay renderer."""
+class CoordinateTransform:
+    """Parsed coordinate transform used by the UI and overlay renderer."""
 
     axis_id: str
     display_name: str
@@ -171,7 +63,6 @@ class CoordinateAxis:
     x_vector: Geometry.FloatPoint
     y_vector: Geometry.FloatPoint
     color: str
-    metadata_source: str
 
 
 @dataclass(frozen=True)
@@ -179,63 +70,26 @@ class VisibleAxisOverlay:
     """Currently visible axis overlay graphics on one API data item."""
     data_item_key: str
     axis_id: str
-    axis: CoordinateAxis
-    graphics_data_item: ApiDataItemLike
+    axis: CoordinateTransform
+    graphics_data_item: Facade.DataItem
     color: str
     graphics: tuple[StoredGraphic, ...]
 
 
 # --------------------------------------------------------------------------------------
-# AxesStream accessor functions
-#
-# UI and plotting code should only use these functions to read axes stream data.
-# They define the stable stream-accessor boundary
-# expected to remain when the real stream object moves into metadata / niondata.
+# Coordinate transform payload consumed by the plotter
 # --------------------------------------------------------------------------------------
 
 @dataclass(frozen=True)
-class AxesStream:
-    """Axes stream object consumed by UI / plotting code.
+class CoordinateTransforms:
+    """Coordinate transform payload consumed by UI / plotting code."""
 
-    source_data_item:
-        Data item used to construct the stream.
-    axes:
-        Immutable mapping from axis id to parsed CoordinateAxis.
-    metadata_source:
-        Metadata source path used to construct the stream.
-    """
-
-    source_data_item: ApiDataItemLike
-    axes: typing.Mapping[str, CoordinateAxis]
+    transforms: typing.Mapping[str, CoordinateTransform]
     metadata_source: str
 
 
-def get_source_data_item_from_axes_stream(axes_stream: AxesStream) -> ApiDataItemLike:
-    """Return the source data item used to build this axes stream."""
-
-    return axes_stream.source_data_item
-
-
-def get_axes_from_axes_stream(axes_stream: AxesStream) -> typing.Mapping[str, CoordinateAxis]:
-    """Return all axes from an axes stream."""
-
-    return axes_stream.axes
-
-
-def get_axis_from_axes_stream(axes_stream: AxesStream, axis_id: str) -> CoordinateAxis | None:
-    """Return a single axis from an axes stream."""
-
-    return axes_stream.axes.get(axis_id)
-
-
-def get_metadata_source_from_axes_stream(axes_stream: AxesStream) -> str:
-    """Return the metadata source used to construct this axes stream."""
-
-    return axes_stream.metadata_source
-
-
 # --------------------------------------------------------------------------------------
-# UI and plotting code - consumes AxesStream only
+# UI and plotting code
 # --------------------------------------------------------------------------------------
 
 class ExperimentalAxesPlotterHandler(Declarative.Handler):
@@ -246,30 +100,51 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
 
         api_broker = PlugInManager.APIBroker()
         facade_api = typing.cast(Facade.API, api_broker.get_api(version="~1.0"))
-        self._api: ApiLike = typing.cast(ApiLike, facade_api)
+        self._api = facade_api
 
         self._rebuild_widget_fn = rebuild_widget_fn
-        self._current_display_item: ApiDisplayLike | None = None
-        self._current_axes_stream: AxesStream | None = None
+        self._current_display_item: Facade.Display | None = None
+        self._current_coordinate_transforms: CoordinateTransforms | None = None
 
         self.axis_ids: list[str] = []
 
-        self._axis_id_to_axis: dict[str, CoordinateAxis] = {}
+        self._axis_id_to_axis: dict[str, CoordinateTransform] = {}
         self._axis_id_to_safeid: dict[str, str] = {}
         self._safeid_to_axis_id: dict[str, str] = {}
         self._axis_graphics: dict[AxisGraphicKey, VisibleAxisOverlay] = {}
         self._axis_toggle_callback_names: set[str] = set()
 
-        self.full_length_enabled = False
+        self._full_length_enabled = False
         self.status_text = "Select a display panel containing a data item."
 
         self._ui = Declarative.DeclarativeUI()
         self.ui_view = self._build_ui()
 
-        self._axes_stream_stream = self._create_axes_value_stream()
-        self._axes_stream_listener: EventListenerLike | None = (
-            self._axes_stream_stream.value_stream.listen(self._axes_stream_changed)
+        self._coordinate_transforms_stream = self._create_coordinate_transforms_stream()
+        self._coordinate_transforms_listener: EventListenerLike | None = (
+            self._coordinate_transforms_stream.value_stream.listen(self._coordinate_transforms_changed)
         )
+
+    @property
+    def full_length_enabled(self) -> bool:
+        """Whether existing and future overlays should be drawn as full-length lines."""
+
+        return self._full_length_enabled
+
+    @full_length_enabled.setter
+    def full_length_enabled(self, value: object) -> None:
+        """Rebuild visible overlays when the Declarative checkbox binding changes."""
+
+        enabled = bool(value)
+
+        if enabled == self._full_length_enabled:
+            return
+
+        self._full_length_enabled = enabled
+        self._notify_property_changed("full_length_enabled")
+
+        if self._axis_graphics:
+            self._rebuild_existing_axes()
 
     def close(self) -> None:
         """Declarative widget close.
@@ -282,61 +157,64 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
     def close_for_panel(self) -> None:
         """Clean up streams and overlays because the actual panel is closing."""
 
-        if self._axes_stream_listener is not None:
+        if self._coordinate_transforms_listener is not None:
             try:
-                self._axes_stream_listener.close()
+                self._coordinate_transforms_listener.close()
             except Exception:
                 traceback.print_exc()
 
-            self._axes_stream_listener = None
+            self._coordinate_transforms_listener = None
 
         self._remove_all_axis_graphics()
 
-    def _create_axes_value_stream(self) -> Stream.ValueStream[AxesStream | None]:
-        """Create the current AxesStream value stream."""
+    def _create_coordinate_transforms_stream(self) -> Stream.ValueStream[CoordinateTransforms | None]:
+        """Create the current CoordinateTransforms value stream."""
 
         try:
             return typing.cast(
-                Stream.ValueStream[AxesStream | None],
+                Stream.ValueStream[CoordinateTransforms | None],
                 Stream.ValueStream(None)
             )
         except TypeError:
-            axes_stream_stream = typing.cast(
-                Stream.ValueStream[AxesStream | None],
+            # Older Nion Stream.ValueStream builds do not accept an initial value
+            coordinate_transforms_stream = typing.cast(
+                Stream.ValueStream[CoordinateTransforms | None],
                 Stream.ValueStream()
             )
-            axes_stream_stream.value = None
-            return axes_stream_stream
+            coordinate_transforms_stream.value = None
+            return coordinate_transforms_stream
 
-    def _set_axes_stream_value(self, axes_stream: AxesStream | None) -> None:
-        """Set the current axes stream and force the UI state to update."""
+    def _set_coordinate_transforms_value(self, coordinate_transforms: CoordinateTransforms | None) -> None:
+        """Set the current coordinate transforms and force the UI state to update."""
 
         try:
-            self._axes_stream_stream.value = axes_stream
+            self._coordinate_transforms_stream.value = coordinate_transforms
         except Exception:
             traceback.print_exc()
 
-        self._axes_stream_changed(axes_stream)
+        self._coordinate_transforms_changed(coordinate_transforms)
 
-    def _axes_stream_changed(self, axes_stream: AxesStream | None) -> None:
-        """Refresh handler state when the current AxesStream changes."""
+    def _coordinate_transforms_changed(self, coordinate_transforms: CoordinateTransforms | None) -> None:
+        """Refresh handler state when the current CoordinateTransforms changes."""
 
-        self._current_axes_stream = axes_stream
-        self._refresh_axes_from_axes_stream(axes_stream)
+        self._current_coordinate_transforms = coordinate_transforms
+        self._refresh_axes_from_coordinate_transforms(coordinate_transforms)
         self._rebuild_ui()
 
-    def set_display_item(self, display_item: ApiDisplayLike | None) -> None:
+    def set_display_item(self, display_item: Facade.Display | None) -> None:
         """Update axes from the selected/focused display item."""
 
         self._current_display_item = display_item
-        self._set_axes_stream_value(self._create_axes_stream_for_current_display_item())
+        self._set_coordinate_transforms_value(self._create_coordinate_transforms_for_current_display_item())
 
     def refresh_from_current_selection(self) -> None:
         """Manual fallback refresh using the current display item or API target."""
 
-        self._set_axes_stream_value(self._create_axes_stream_for_current_display_item())
+        self._set_coordinate_transforms_value(self._create_coordinate_transforms_for_current_display_item())
 
     def _notify_property_changed(self, property_name: str) -> None:
+        """Fire a Declarative property-changed event when the handler supports it."""
+
         try:
             self.property_changed_event.fire(property_name)
         except AttributeError:
@@ -345,11 +223,13 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
             traceback.print_exc()
 
     def _rebuild_ui(self) -> None:
+        """Recreate the Declarative UI and ask the owning widget to replace it."""
+
         self.ui_view = self._build_ui()
         self._rebuild_widget_fn()
 
     def _build_ui(self) -> Declarative.UIDescriptionResult:
-        """Build the Declarative UI description in the original compact style."""
+        """Build the Declarative UI """
 
         u = self._ui
 
@@ -420,6 +300,8 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         return _handler
 
     def _sanitize_axis_id(self, axis_id: str) -> str:
+        """Return an identifier-safe suffix for dynamic Declarative bindings."""
+
         out: list[str] = []
 
         for ch in axis_id:
@@ -433,18 +315,22 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         return safe_id
 
     def _clear_axis_color_attributes(self) -> None:
+        """Remove dynamic colour binding attributes from the handler."""
+
         for attr_name in list(vars(self)):
             if attr_name.startswith("axis_color_"):
-                object.__delattr__(self, attr_name)
+                delattr(self, attr_name)
 
     def _clear_axis_toggle_callbacks(self) -> None:
+        """Remove dynamic axis toggle callbacks from the handler."""
+
         for callback_name in list(self._axis_toggle_callback_names):
             if callback_name in self.__dict__:
-                object.__delattr__(self, callback_name)
+                delattr(self, callback_name)
 
         self._axis_toggle_callback_names.clear()
 
-    def _get_target_document_window(self) -> ApiDocumentWindowLike | None:
+    def _get_target_document_window(self) -> Facade.DocumentWindow | None:
         windows = self._api.application.document_windows
 
         if not windows:
@@ -456,7 +342,7 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
 
         return windows[0]
 
-    def _get_active_data_item(self) -> ApiDataItemLike | None:
+    def _get_active_data_item(self) -> Facade.DataItem | None:
         window = self._get_target_document_window()
 
         if window is None:
@@ -470,25 +356,30 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
 
         return None
 
-    def _get_data_item_key(self, data_item: ApiDataItemLike) -> str:
+    def _get_data_item_key(self, data_item: Facade.DataItem) -> str:
+
         return str(data_item.uuid)
 
-    def _create_axes_stream_for_current_display_item(self) -> AxesStream | None:
+    def _create_coordinate_transforms_for_current_display_item(self) -> CoordinateTransforms | None:
+        """Create transforms from the current display item, falling back to the active item."""
+
         if self._current_display_item is not None:
-            return create_axes_stream_from_display_item(self._current_display_item)
+            return create_coordinate_transforms_from_display_item(self._current_display_item)
 
         data_item = self._get_active_data_item()
 
         if data_item is None:
             return None
 
-        return create_axes_stream_from_data_item(data_item)
+        return create_coordinate_transforms_from_data_item(data_item)
 
-    def _get_axes_stream(self) -> AxesStream | None:
-        return self._current_axes_stream
+    def _get_coordinate_transforms(self) -> CoordinateTransforms | None:
+        """Return the currently selected coordinate-transform payload."""
 
-    def _refresh_axes_from_axes_stream(self, axes_stream: AxesStream | None) -> None:
-        """Refresh axis UI state from the current AxesStream.
+        return self._current_coordinate_transforms
+
+    def _refresh_axes_from_coordinate_transforms(self, coordinate_transforms: CoordinateTransforms | None) -> None:
+        """Refresh axis UI state from the current CoordinateTransforms.
 
         This clears current UI axis state, removes stale colour/callback bindings,
         sorts the axis ids, and repopulates the axis lookup for the current stream.
@@ -502,13 +393,13 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         self._clear_axis_color_attributes()
         self._clear_axis_toggle_callbacks()
 
-        if axes_stream is None:
+        if coordinate_transforms is None:
             self.status_text = "Selected display panel has no readable axes metadata."
             self._notify_property_changed("status_text")
             return
 
-        axes = get_axes_from_axes_stream(axes_stream)
-        metadata_source = get_metadata_source_from_axes_stream(axes_stream)
+        axes = coordinate_transforms.transforms
+        metadata_source = coordinate_transforms.metadata_source
 
         if not axes:
             self.status_text = "Selected display panel has no readable axes metadata."
@@ -553,15 +444,21 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         self._notify_property_changed("status_text")
 
     def _shape_to_height_width(self, shape_value: object) -> tuple[int, int] | None:
+        """Convert an xdata value to display height and width."""
+
         if isinstance(shape_value, (tuple, list)) and len(shape_value) >= 2:
             return int(shape_value[-2]), int(shape_value[-1])
 
         return None
 
-    def _get_active_data_shape(self, data_item: ApiDataItemLike) -> tuple[int, int] | None:
+    def _get_active_data_shape(self, data_item: Facade.DataItem) -> tuple[int, int] | None:
+        """Return the active data shape used for normalized overlay vector scaling."""
+
         return self._shape_to_height_width(data_item.xdata.data_shape)
 
     def _normalize_vector(self, vector: Geometry.FloatPoint) -> Geometry.FloatPoint:
+        """Return a unit vector, preserving zero vectors as zero vectors."""
+
         length = float(abs(vector))
 
         if length <= 1e-12:
@@ -570,6 +467,8 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         return Geometry.FloatPoint(y=vector.y / length, x=vector.x / length)
 
     def _normalize_vector_for_display(self, vector: Geometry.FloatPoint, data_shape: tuple[int, int] | None) -> Geometry.FloatPoint:
+        """Normalize a metadata vector while compensating for non-square displays."""
+
         if data_shape is None:
             return self._normalize_vector(vector)
 
@@ -593,6 +492,8 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         )
 
     def _clamp_point(self, point: Geometry.FloatPoint) -> Geometry.FloatPoint:
+        """Clamp a normalized point to the display bounds."""
+
         return Geometry.FloatPoint(
             y=min(max(point.y, 0.0), 1.0),
             x=min(max(point.x, 0.0), 1.0)
@@ -612,7 +513,7 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
 
         return origin, end
 
-    def _make_line_region(self, data_item: ApiDataItemLike, start: Geometry.FloatPoint, end: Geometry.FloatPoint, color: str, label: str, *, arrow_at_end: bool = True) -> ApiGraphicLike:
+    def _make_line_region(self, data_item: Facade.DataItem, start: Geometry.FloatPoint, end: Geometry.FloatPoint, color: str, label: str, *, arrow_at_end: bool = True) -> Facade.Graphic:
         """Create and configure one Swift line-region overlay."""
 
         graphic = data_item.add_line_region(start.y, start.x, end.y, end.x)
@@ -625,7 +526,13 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
 
         return graphic
 
-    def _append_axis_line_region(self, graphics_to_add: list[StoredGraphic], graphics_data_item: ApiDataItemLike, start: Geometry.FloatPoint, end: Geometry.FloatPoint, color: str, label: str, *, arrow_at_end: bool = True) -> None:
+    def _append_axis_line_region(self, graphics_to_add: list[StoredGraphic], graphics_data_item: Facade.DataItem, start: Geometry.FloatPoint, end: Geometry.FloatPoint, color: str, label: str, *, arrow_at_end: bool = True) -> None:
+        """Append one new overlay graphic to the mutable per-axis collection.
+
+        The concrete list type is intentional because this helper mutates the caller-owned
+        collection while building an overlay atomically.
+        """
+
         graphic = self._make_line_region(
             graphics_data_item,
             start,
@@ -636,8 +543,12 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         )
         graphics_to_add.append((graphics_data_item, graphic))
 
-    def _show_axis_overlay(self, data_item_key: str, axis: CoordinateAxis, graphics_data_item: ApiDataItemLike, color: str) -> tuple[StoredGraphic, ...] | None:
-        """Create overlay graphics for one axis on one API data item."""
+    def _show_axis_overlay(self, data_item_key: str, axis: CoordinateTransform, graphics_data_item: Facade.DataItem, color: str) -> tuple[StoredGraphic, ...] | None:
+        """Create overlay graphics for one axis on one API data item.
+
+        A tuple is returned intentionally because VisibleAxisOverlay is frozen and stores
+        an immutable snapshot of the graphics that were successfully created.
+        """
 
         data_shape = self._get_active_data_shape(graphics_data_item)
 
@@ -736,25 +647,25 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
     def _toggle_axis(self, axis_id: str) -> None:
         """Toggle one axis overlay on the active API data item.
 
-        The available axis must come from the current AxesStream. Overlay state is
+        The available axis must come from the current CoordinateTransforms. Overlay state is
         keyed by data item and axis id so overlays remain visible when focus moves.
         """
 
-        axes_stream = self._get_axes_stream()
+        coordinate_transforms = self._get_coordinate_transforms()
 
-        if axes_stream is None:
-            self.status_text = "No axes stream available for the selected display panel."
+        if coordinate_transforms is None:
+            self.status_text = "No coordinate transforms available for the selected display panel."
             self._notify_property_changed("status_text")
-            self._refresh_axes_from_axes_stream(None)
+            self._refresh_axes_from_coordinate_transforms(None)
             self._rebuild_ui()
             return
 
-        axis = get_axis_from_axes_stream(axes_stream, axis_id)
+        axis = coordinate_transforms.transforms.get(axis_id)
 
         if axis is None:
             self.status_text = f"Axis {axis_id!r} is not available on the selected display panel."
             self._notify_property_changed("status_text")
-            self._refresh_axes_from_axes_stream(axes_stream)
+            self._refresh_axes_from_coordinate_transforms(coordinate_transforms)
             self._rebuild_ui()
             return
 
@@ -848,13 +759,11 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
                 graphics=graphics
             )
 
-    # Declarative UI expects on_<name> handlers for direct button callbacks.
     def on_clear_all_clicked(self, widget: Declarative.UIWidget) -> None:
         self._remove_all_axis_graphics()
         self.status_text = "Cleared all axis overlays."
         self._notify_property_changed("status_text")
 
-    # Declarative UI expects on_<name> handlers for direct button callbacks.
     def on_refresh_clicked(self, widget: Declarative.UIWidget) -> None:
         self.refresh_from_current_selection()
 
@@ -864,7 +773,7 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
 # --------------------------------------------------------------------------------------
 
 class ExperimentalAxesPlotterPanel(Panel.Panel):
-    def __init__(self, document_controller: DocumentController.DocumentController, panel_id: str) -> None:
+    def __init__(self, document_controller: DocumentController.DocumentController, panel_id: str, properties: typing.Mapping[str, object]) -> None:
         """Create the experimental panel."""
 
         super().__init__(document_controller, panel_id, PANEL_TITLE)
@@ -906,16 +815,16 @@ class ExperimentalAxesPlotterPanel(Panel.Panel):
 
         self.__display_item_changed_listeners.append(focused_listener)
 
-    def __get_current_display_item(self) -> ApiDisplayLike | None:
+    def __get_current_display_item(self) -> Facade.Display | None:
         focused_display_item = self.__document_controller.focused_display_item
 
         if focused_display_item is not None:
-            return typing.cast(ApiDisplayLike, focused_display_item)
+            return typing.cast(Facade.Display, focused_display_item)
 
         selected_display_item = self.__document_controller.selected_display_item
 
         if selected_display_item is not None:
-            return typing.cast(ApiDisplayLike, selected_display_item)
+            return typing.cast(Facade.Display, selected_display_item)
 
         return None
 
@@ -929,7 +838,7 @@ class ExperimentalAxesPlotterPanel(Panel.Panel):
             self.__handler.set_display_item(current_display_item)
             return
 
-        self.__handler.set_display_item(typing.cast(ApiDisplayLike | None, display_item))
+        self.__handler.set_display_item(typing.cast(Facade.Display | None, display_item))
 
     def close(self) -> None:
         for listener in self.__display_item_changed_listeners:
@@ -962,12 +871,10 @@ def unregister_panel() -> None:
 class ExperimentalAxesPlotterExtension:
     extension_id = "nion.extension.experimental_axes_plotter"
 
-    def __init__(self, api_broker: ApiBrokerLike) -> None:
+    def __init__(self, api_broker: typing.Any) -> None:
         """Register the panel."""
 
-        api = typing.cast(Facade.API, api_broker.get_api(version="~1.0"))
-        typing.cast(ApiLike, api)
-
+        api_broker.get_api(version="~1.0")
         register_panel()
 
     def close(self) -> None:
@@ -975,19 +882,15 @@ class ExperimentalAxesPlotterExtension:
 
 
 # --------------------------------------------------------------------------------------
-# Temporary stream construction - metadata navigation lives here for now
+# Metadata-backed CoordinateTransforms construction
 #
-# This block should eventually be replaced by a real AxesStream supplied by
-# metadata / niondata. Until then a temporary method for raw metadata navigation
-# and parsing is intentionally collected here.
+# This section will be replaced when CoordinateTransforms are supplied directly by metadata / niondata.
 # --------------------------------------------------------------------------------------
 
-@temporary(TEMPORARY_STREAM_REASON)
 def _is_mapping(value: typing.Any) -> typing.TypeGuard[typing.Mapping[typing.Any, typing.Any]]:
     return isinstance(value, typing.Mapping)
 
 
-@temporary(TEMPORARY_STREAM_REASON)
 def _metadata_get_path(metadata: typing.Mapping[typing.Any, typing.Any], path: str) -> typing.Any:
     """Read a dotted metadata path from the known metadata dictionary shape."""
 
@@ -1008,8 +911,7 @@ def _metadata_get_path(metadata: typing.Mapping[typing.Any, typing.Any], path: s
     return current
 
 
-@temporary(TEMPORARY_STREAM_REASON)
-def get_data_item_metadata(data_item: ApiDataItemLike) -> typing.Mapping[typing.Any, typing.Any]:
+def get_data_item_metadata(data_item: Facade.DataItem) -> typing.Mapping[typing.Any, typing.Any]:
     """Return metadata from the known data-item shape."""
 
     metadata = data_item.metadata
@@ -1020,8 +922,7 @@ def get_data_item_metadata(data_item: ApiDataItemLike) -> typing.Mapping[typing.
     return {}
 
 
-@temporary(TEMPORARY_STREAM_REASON)
-def get_axis_transformation_matrices_metadata(data_item: ApiDataItemLike) -> typing.Mapping[typing.Any, typing.Any] | None:
+def get_axis_transformation_matrices_metadata(data_item: Facade.DataItem) -> typing.Mapping[typing.Any, typing.Any] | None:
     """Return instrument axis transformation matrices from metadata."""
 
     axis_transformation_matrices = _metadata_get_path(
@@ -1035,7 +936,6 @@ def get_axis_transformation_matrices_metadata(data_item: ApiDataItemLike) -> typ
     return None
 
 
-@temporary(TEMPORARY_STREAM_REASON)
 def _read_float_point(value: typing.Any) -> Geometry.FloatPoint | None:
     """Read a point/vector from sequence, y/x mapping, or 0/1 mapping."""
 
@@ -1059,7 +959,6 @@ def _read_float_point(value: typing.Any) -> Geometry.FloatPoint | None:
     return None
 
 
-@temporary(TEMPORARY_STREAM_REASON)
 def _humanize_axis_id(axis_id: str) -> str:
     names = {
         "tv": "TV",
@@ -1081,7 +980,6 @@ def _humanize_axis_id(axis_id: str) -> str:
     return axis_id.replace("_", " ").replace("-", " ").title()
 
 
-@temporary(TEMPORARY_STREAM_REASON)
 def _default_axis_color(axis_id: str) -> str:
     normalized = "".join(ch.lower() for ch in axis_id if ch.isalnum())
 
@@ -1115,7 +1013,6 @@ def _default_axis_color(axis_id: str) -> str:
     return "#8E8E93"
 
 
-@temporary(TEMPORARY_STREAM_REASON)
 def _as_float(value: typing.Any) -> float | None:
     try:
         return float(value)
@@ -1123,7 +1020,6 @@ def _as_float(value: typing.Any) -> float | None:
         return None
 
 
-@temporary(TEMPORARY_STREAM_REASON)
 def _metadata_key_sort_value(key: typing.Any) -> tuple[int, int | str]:
     """Return a stable sort key for scalar metadata entries.
 
@@ -1142,7 +1038,6 @@ def _metadata_key_sort_value(key: typing.Any) -> tuple[int, int | str]:
         return 1, key_text
 
 
-@temporary(TEMPORARY_STREAM_REASON)
 def _read_matrix_from_mapping(value: typing.Mapping[typing.Any, typing.Any]) -> tuple[tuple[str, str], Geometry.FloatPoint, Geometry.FloatPoint] | None:
     """Read named basis vectors from one axis transformation matrix."""
 
@@ -1212,8 +1107,7 @@ def _read_matrix_from_mapping(value: typing.Mapping[typing.Any, typing.Any]) -> 
     return None
 
 
-@temporary(TEMPORARY_STREAM_REASON)
-def _read_matrix_axis_metadata(axis_id: str, value: typing.Any) -> CoordinateAxis | None:
+def _read_matrix_axis_metadata(axis_id: str, value: typing.Any) -> CoordinateTransform | None:
     """Read one axis from instrument.axis_transformation_matrices metadata."""
 
     axis_type: tuple[str, str]
@@ -1263,20 +1157,18 @@ def _read_matrix_axis_metadata(axis_id: str, value: typing.Any) -> CoordinateAxi
     else:
         return None
 
-    return CoordinateAxis(
+    return CoordinateTransform(
         axis_id=axis_id,
         display_name=_humanize_axis_id(axis_id),
         axis_type=axis_type,
         origin=Geometry.FloatPoint(y=0.5, x=0.5),
         x_vector=x_vector,
         y_vector=y_vector,
-        color=_default_axis_color(axis_id),
-        metadata_source=AXIS_TRANSFORMATION_MATRICES_METADATA_PATH
+        color=_default_axis_color(axis_id)
     )
 
 
-@temporary(TEMPORARY_STREAM_REASON)
-def get_axes_from_axis_transformation_matrices(data_item: ApiDataItemLike) -> typing.Mapping[str, CoordinateAxis]:
+def get_axes_from_axis_transformation_matrices(data_item: Facade.DataItem) -> typing.Mapping[str, CoordinateTransform]:
     """Return axes from instrument.axis_transformation_matrices metadata."""
 
     axis_transformation_matrices = get_axis_transformation_matrices_metadata(data_item)
@@ -1284,7 +1176,7 @@ def get_axes_from_axis_transformation_matrices(data_item: ApiDataItemLike) -> ty
     if axis_transformation_matrices is None:
         return types.MappingProxyType({})
 
-    axes: dict[str, CoordinateAxis] = {}
+    axes: dict[str, CoordinateTransform] = {}
 
     for raw_axis_id, axis_metadata in axis_transformation_matrices.items():
         axis_id = str(raw_axis_id)
@@ -1296,49 +1188,26 @@ def get_axes_from_axis_transformation_matrices(data_item: ApiDataItemLike) -> ty
     return types.MappingProxyType(axes)
 
 
-@temporary(TEMPORARY_STREAM_REASON)
-def get_coordinate_system_axes(data_item: ApiDataItemLike) -> typing.Mapping[str, CoordinateAxis]:
-    """Return available coordinate axes from the current metadata format."""
+def create_coordinate_transforms_from_data_item(data_item: Facade.DataItem) -> CoordinateTransforms | None:
+    """Construct CoordinateTransforms from the known data-item metadata shape."""
 
-    return get_axes_from_axis_transformation_matrices(data_item)
+    transforms = get_axes_from_axis_transformation_matrices(data_item)
 
-
-@temporary(TEMPORARY_STREAM_REASON)
-def get_coordinate_metadata_source_summary(data_item: ApiDataItemLike) -> str:
-    axis_transformation_matrices = get_axis_transformation_matrices_metadata(data_item)
-
-    if axis_transformation_matrices is not None:
-        axes = get_axes_from_axis_transformation_matrices(data_item)
-
-        if axes:
-            return AXIS_TRANSFORMATION_MATRICES_METADATA_PATH
-
-    return "none"
-
-
-@temporary(TEMPORARY_STREAM_REASON)
-def create_axes_stream_from_data_item(data_item: ApiDataItemLike) -> AxesStream | None:
-    """Construct an AxesStream from the known data-item metadata shape."""
-
-    axes = get_coordinate_system_axes(data_item)
-
-    if not axes:
+    if not transforms:
         return None
 
-    return AxesStream(
-        source_data_item=data_item,
-        axes=types.MappingProxyType(dict(axes)),
-        metadata_source=get_coordinate_metadata_source_summary(data_item)
+    return CoordinateTransforms(
+        transforms=transforms,
+        metadata_source=AXIS_TRANSFORMATION_MATRICES_METADATA_PATH
     )
 
 
-@temporary(TEMPORARY_STREAM_REASON)
-def create_axes_stream_from_display_item(display_item: ApiDisplayLike) -> AxesStream | None:
-    """Construct an AxesStream from the known display-item shape."""
+def create_coordinate_transforms_from_display_item(display_item: Facade.Display) -> CoordinateTransforms | None:
+    """Construct CoordinateTransforms from the known display-item shape."""
 
     data_item = display_item.data_item
 
     if data_item is None:
         return None
 
-    return create_axes_stream_from_data_item(data_item)
+    return create_coordinate_transforms_from_data_item(data_item)
