@@ -28,6 +28,7 @@ from nion.swift.model import PlugInManager
 from nion.typeshed import API_1_0 as Facade
 from nion.ui import Declarative
 from nion.utils import Geometry
+from nion.utils import Model
 from nion.utils import Stream
 
 
@@ -110,12 +111,12 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
 
         self._axis_id_to_axis: dict[str, CoordinateTransform] = {}
         self._axis_id_to_safeid: dict[str, str] = {}
-        self._safeid_to_axis_id: dict[str, str] = {}
         self._axis_graphics: dict[AxisGraphicKey, VisibleAxisOverlay] = {}
         self._axis_toggle_callback_names: set[str] = set()
 
-        self._full_length_enabled = False
-        self.status_text = "Select a display panel containing a data item."
+        self.full_length_enabled = Model.PropertyModel[bool](False)
+        self.full_length_enabled.on_value_changed = self._full_length_enabled_changed
+        self.status_text = Model.PropertyModel[str]("Select a display panel containing a data item.")
 
         self._ui = Declarative.DeclarativeUI()
         self.ui_view = self._build_ui()
@@ -125,23 +126,8 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
             self._coordinate_transforms_stream.value_stream.listen(self._coordinate_transforms_changed)
         )
 
-    @property
-    def full_length_enabled(self) -> bool:
-        """Whether existing and future overlays should be drawn as full-length lines."""
-
-        return self._full_length_enabled
-
-    @full_length_enabled.setter
-    def full_length_enabled(self, value: object) -> None:
-        """Rebuild visible overlays when the Declarative checkbox binding changes."""
-
-        enabled = bool(value)
-
-        if enabled == self._full_length_enabled:
-            return
-
-        self._full_length_enabled = enabled
-        self._notify_property_changed("full_length_enabled")
+    def _full_length_enabled_changed(self, value: bool | None) -> None:
+        """Rebuild visible overlays when the full-length PropertyModel changes."""
 
         if self._axis_graphics:
             self._rebuild_existing_axes()
@@ -192,8 +178,6 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         except Exception:
             traceback.print_exc()
 
-        self._coordinate_transforms_changed(coordinate_transforms)
-
     def _coordinate_transforms_changed(self, coordinate_transforms: CoordinateTransforms | None) -> None:
         """Refresh handler state when the current CoordinateTransforms changes."""
 
@@ -211,16 +195,6 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         """Manual fallback refresh using the current display item or API target."""
 
         self._set_coordinate_transforms_value(self._create_coordinate_transforms_for_current_display_item())
-
-    def _notify_property_changed(self, property_name: str) -> None:
-        """Fire a Declarative property-changed event when the handler supports it."""
-
-        try:
-            self.property_changed_event.fire(property_name)
-        except AttributeError:
-            return
-        except Exception:
-            traceback.print_exc()
 
     def _rebuild_ui(self) -> None:
         """Recreate the Declarative UI and ask the owning widget to replace it."""
@@ -244,7 +218,7 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         options_row = u.create_row(
             u.create_check_box(
                 text="Full length lines",
-                checked="@binding(full_length_enabled)",
+                checked="@binding(full_length_enabled.value)",
                 tool_tip="Draw each axis as a full line centered on the origin."
             ),
             u.create_stretch(),
@@ -253,7 +227,7 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
 
         if not self.axis_ids:
             body = u.create_column(
-                u.create_label(text="@binding(status_text)", width=460),
+                u.create_label(text="@binding(status_text.value)", width=460),
                 spacing=6
             )
         else:
@@ -284,12 +258,12 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
                 )
 
             body = u.create_column(
-                u.create_label(text="@binding(status_text)", width=460),
+                u.create_label(text="@binding(status_text.value)", width=460),
                 *rows,
                 spacing=6
             )
 
-        return u.create_column(header, options_row, body, spacing=10)
+        return u.create_column(header, options_row, body, u.create_stretch(), spacing=10)
 
     def _make_toggle_handler(self, axis_id: str) -> typing.Callable[[Declarative.UIWidget], None]:
         """Create a direct button callback that toggles one axis."""
@@ -340,6 +314,8 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
             if window.target_display is not None:
                 return window
 
+        # Prefer a window with an active target display. If none exists, fall back to the
+        # first document window so manual refresh can still work when focus state is not set.
         return windows[0]
 
     def _get_active_data_item(self) -> Facade.DataItem | None:
@@ -389,21 +365,18 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         self.axis_ids.clear()
         self._axis_id_to_axis.clear()
         self._axis_id_to_safeid.clear()
-        self._safeid_to_axis_id.clear()
         self._clear_axis_color_attributes()
         self._clear_axis_toggle_callbacks()
 
         if coordinate_transforms is None:
-            self.status_text = "Selected display panel has no readable axes metadata."
-            self._notify_property_changed("status_text")
+            self.status_text.value = "Selected display panel has no readable axes metadata."
             return
 
         axes = coordinate_transforms.transforms
         metadata_source = coordinate_transforms.metadata_source
 
         if not axes:
-            self.status_text = "Selected display panel has no readable axes metadata."
-            self._notify_property_changed("status_text")
+            self.status_text.value = "Selected display panel has no readable axes metadata."
             return
 
         preferred_order = (
@@ -436,12 +409,10 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
 
             self._axis_id_to_axis[axis_id] = axis
             self._axis_id_to_safeid[axis_id] = safeid
-            self._safeid_to_axis_id[safeid] = axis_id
 
             setattr(self, f"axis_color_{safeid}", axis.color)
 
-        self.status_text = f"Loaded {len(self.axis_ids)} axes from {metadata_source}."
-        self._notify_property_changed("status_text")
+        self.status_text.value = f"Loaded {len(self.axis_ids)} axes from {metadata_source}."
 
     def _shape_to_height_width(self, shape_value: object) -> tuple[int, int] | None:
         """Convert an xdata value to display height and width."""
@@ -543,7 +514,7 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         )
         graphics_to_add.append((graphics_data_item, graphic))
 
-    def _show_axis_overlay(self, data_item_key: str, axis: CoordinateTransform, graphics_data_item: Facade.DataItem, color: str) -> tuple[StoredGraphic, ...] | None:
+    def _show_axis_overlay(self, axis: CoordinateTransform, graphics_data_item: Facade.DataItem, color: str) -> tuple[StoredGraphic, ...] | None:
         """Create overlay graphics for one axis on one API data item.
 
         A tuple is returned intentionally because VisibleAxisOverlay is frozen and stores
@@ -556,8 +527,7 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         y_unit_vector = self._normalize_vector_for_display(axis.y_vector, data_shape)
 
         if abs(x_unit_vector) <= 1e-12 or abs(y_unit_vector) <= 1e-12:
-            self.status_text = f"Cannot plot {axis.display_name}: metadata vector is near zero."
-            self._notify_property_changed("status_text")
+            self.status_text.value = f"Cannot plot {axis.display_name}: metadata vector is near zero."
             return None
 
         line_length = 0.22
@@ -597,7 +567,7 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
                 arrow_at_end=True
             )
 
-            if self.full_length_enabled:
+            if bool(self.full_length_enabled.value):
                 x_backward_start, x_backward_end = self._axis_line_points(
                     axis.origin,
                     x_unit_vector,
@@ -638,8 +608,7 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
                     traceback.print_exc()
 
             traceback.print_exc()
-            self.status_text = f"Failed to plot axis {axis.display_name}."
-            self._notify_property_changed("status_text")
+            self.status_text.value = f"Failed to plot axis {axis.display_name}."
             return None
 
         return tuple(graphics_to_add)
@@ -654,8 +623,7 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         coordinate_transforms = self._get_coordinate_transforms()
 
         if coordinate_transforms is None:
-            self.status_text = "No coordinate transforms available for the selected display panel."
-            self._notify_property_changed("status_text")
+            self.status_text.value = "No coordinate transforms available for the selected display panel."
             self._refresh_axes_from_coordinate_transforms(None)
             self._rebuild_ui()
             return
@@ -663,8 +631,7 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         axis = coordinate_transforms.transforms.get(axis_id)
 
         if axis is None:
-            self.status_text = f"Axis {axis_id!r} is not available on the selected display panel."
-            self._notify_property_changed("status_text")
+            self.status_text.value = f"Axis {axis_id!r} is not available on the selected display panel."
             self._refresh_axes_from_coordinate_transforms(coordinate_transforms)
             self._rebuild_ui()
             return
@@ -672,8 +639,7 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         graphics_data_item = self._get_active_data_item()
 
         if graphics_data_item is None:
-            self.status_text = "No active API data item available for axis overlay."
-            self._notify_property_changed("status_text")
+            self.status_text.value = "No active API data item available for axis overlay."
             return
 
         data_item_key = self._get_data_item_key(graphics_data_item)
@@ -681,17 +647,16 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
 
         if overlay_key in self._axis_graphics:
             self._remove_graphics_for_key(overlay_key)
-            self.status_text = f"Removed axis {axis.display_name} from active data item."
-            self._notify_property_changed("status_text")
+            self.status_text.value = f"Removed axis {axis.display_name} from active data item."
             return
 
         safeid = self._axis_id_to_safeid.get(axis_id, self._sanitize_axis_id(axis_id))
-        color = self.__dict__.get(f"axis_color_{safeid}", axis.color)
+        color = getattr(self, f"axis_color_{safeid}", axis.color)
 
         if not isinstance(color, str):
             color = axis.color
 
-        graphics = self._show_axis_overlay(data_item_key, axis, graphics_data_item, color)
+        graphics = self._show_axis_overlay(axis, graphics_data_item, color)
 
         if graphics is None:
             return
@@ -705,8 +670,7 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
             graphics=graphics
         )
 
-        self.status_text = f"Displayed axis {axis.display_name} on active data item."
-        self._notify_property_changed("status_text")
+        self.status_text.value = f"Displayed axis {axis.display_name} on active data item."
 
     def _remove_graphics_for_key(self, overlay_key: AxisGraphicKey) -> None:
         overlay = self._axis_graphics.pop(overlay_key, None)
@@ -728,18 +692,10 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         """Rebuild all currently visible overlays after display-option changes."""
 
         overlays = list(self._axis_graphics.values())
-        self._axis_graphics.clear()
-
-        for overlay in overlays:
-            for data_item, graphic in overlay.graphics:
-                try:
-                    data_item.remove_region(graphic)
-                except Exception:
-                    traceback.print_exc()
+        self._remove_all_axis_graphics()
 
         for overlay in overlays:
             graphics = self._show_axis_overlay(
-                overlay.data_item_key,
                 overlay.axis,
                 overlay.graphics_data_item,
                 overlay.color
@@ -761,8 +717,7 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
 
     def on_clear_all_clicked(self, widget: Declarative.UIWidget) -> None:
         self._remove_all_axis_graphics()
-        self.status_text = "Cleared all axis overlays."
-        self._notify_property_changed("status_text")
+        self.status_text.value = "Cleared all axis overlays."
 
     def on_refresh_clicked(self, widget: Declarative.UIWidget) -> None:
         self.refresh_from_current_selection()
@@ -983,34 +938,27 @@ def _humanize_axis_id(axis_id: str) -> str:
 def _default_axis_color(axis_id: str) -> str:
     normalized = "".join(ch.lower() for ch in axis_id if ch.isalnum())
 
-    if normalized == "tv":
-        return "#77FF1C"
-
-    if normalized in {"correctoraxis", "corrector"}:
-        return "#FC3A0F"
-
-    if normalized in {"eels", "eelsaxis"}:
-        return "#FF7B00"
-
-    if normalized == "mc":
-        return "#E64DFF"
-
-    if normalized in {"postsample", "postsampleaxis", "post"}:
-        return "#CCB1B1"
-
-    if normalized == "scan":
-        return "#FF0090"
-
-    if normalized in {"stageaxis", "stage"}:
-        return "#00F2FF"
-
-    if normalized in {"stagetiltaxis", "stagetilt"}:
-        return "#EEFF00"
-
-    if normalized == "gun":
-        return "#4DA3FF"
-
-    return "#8E8E93"
+    match normalized:
+        case "tv":
+            return "#77FF1C"
+        case "correctoraxis" | "corrector":
+            return "#FC3A0F"
+        case "eels" | "eelsaxis":
+            return "#FF7B00"
+        case "mc":
+            return "#E64DFF"
+        case "postsample" | "postsampleaxis" | "post":
+            return "#CCB1B1"
+        case "scan":
+            return "#FF0090"
+        case "stageaxis" | "stage":
+            return "#00F2FF"
+        case "stagetiltaxis" | "stagetilt":
+            return "#EEFF00"
+        case "gun":
+            return "#4DA3FF"
+        case _:
+            return "#8E8E93"
 
 
 def _as_float(value: typing.Any) -> float | None:
@@ -1107,55 +1055,48 @@ def _read_matrix_from_mapping(value: typing.Mapping[typing.Any, typing.Any]) -> 
     return None
 
 
+def _read_matrix_from_sequence(value: typing.Sequence[typing.Any]) -> tuple[tuple[str, str], Geometry.FloatPoint, Geometry.FloatPoint] | None:
+    """Read basis vectors from one sequence-style axis transformation matrix."""
+
+    if len(value) >= 2:
+        first_vector = _read_float_point(value[0])
+        second_vector = _read_float_point(value[1])
+
+        if first_vector is not None and second_vector is not None:
+            return ("x", "y"), first_vector, second_vector
+
+    if len(value) < 4:
+        return None
+
+    y0 = _as_float(value[0])
+    x0 = _as_float(value[1])
+    y1 = _as_float(value[2])
+    x1 = _as_float(value[3])
+
+    if y0 is None or x0 is None or y1 is None or x1 is None:
+        return None
+
+    return (
+        ("x", "y"),
+        Geometry.FloatPoint(y=y0, x=x0),
+        Geometry.FloatPoint(y=y1, x=x1)
+    )
+
+
 def _read_matrix_axis_metadata(axis_id: str, value: typing.Any) -> CoordinateTransform | None:
     """Read one axis from instrument.axis_transformation_matrices metadata."""
 
-    axis_type: tuple[str, str]
-    x_vector: Geometry.FloatPoint
-    y_vector: Geometry.FloatPoint
-
     if _is_mapping(value):
         read_result = _read_matrix_from_mapping(value)
-
-        if read_result is None:
-            return None
-
-        axis_type, x_vector, y_vector = read_result
-
     elif isinstance(value, typing.Sequence) and not isinstance(value, str):
-        first_vector: Geometry.FloatPoint | None = None
-        second_vector: Geometry.FloatPoint | None = None
-
-        if len(value) >= 2:
-            first_vector = _read_float_point(value[0])
-            second_vector = _read_float_point(value[1])
-
-        if first_vector is not None and second_vector is not None:
-            axis_type = ("x", "y")
-            x_vector = first_vector
-            y_vector = second_vector
-
-        elif len(value) >= 4:
-            scalar_values = [_as_float(item) for item in value[:4]]
-
-            if not all(item is not None for item in scalar_values):
-                return None
-
-            axis_type = ("x", "y")
-            x_vector = Geometry.FloatPoint(
-                y=typing.cast(float, scalar_values[0]),
-                x=typing.cast(float, scalar_values[1])
-            )
-            y_vector = Geometry.FloatPoint(
-                y=typing.cast(float, scalar_values[2]),
-                x=typing.cast(float, scalar_values[3])
-            )
-
-        else:
-            return None
-
+        read_result = _read_matrix_from_sequence(value)
     else:
         return None
+
+    if read_result is None:
+        return None
+
+    axis_type, x_vector, y_vector = read_result
 
     return CoordinateTransform(
         axis_id=axis_id,
