@@ -27,6 +27,7 @@ from nion.swift import Workspace
 from nion.swift.model import PlugInManager
 from nion.typeshed import API_1_0 as Facade
 from nion.ui import Declarative
+from nion.utils import Event
 from nion.utils import Geometry
 from nion.utils import Model
 from nion.utils import Stream
@@ -35,19 +36,14 @@ from nion.utils import Stream
 PANEL_ID = "experimental-axis-plotter"
 PANEL_TITLE = "[Experimental] Axis plotter"
 
+# STEMController.update_instrument_properties calls stem_controller.get_autostem_properties,
+# which stores the axis_transformation_matrix_metadata at this metadata path.
 AXIS_TRANSFORMATION_MATRICES_METADATA_PATH = "instrument.axis_transformation_matrices"
 
 
 # --------------------------------------------------------------------------------------
 # Shared data types
 # --------------------------------------------------------------------------------------
-
-class EventListenerLike(typing.Protocol):
-    """Minimal event-listener interface returned by Nion event listen calls."""
-
-    def close(self) -> None:
-        ...
-
 
 StoredGraphic = tuple[Facade.DataItem, Facade.Graphic]
 AxisGraphicKey = tuple[str, str]
@@ -108,6 +104,8 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         self._current_coordinate_transforms: CoordinateTransforms | None = None
 
         self.axis_ids: list[str] = []
+        self.image_axis_ids: list[str] = []
+        self.image_axis_display_names: list[str] = []
 
         self._axis_id_to_axis: dict[str, CoordinateTransform] = {}
         self._axis_id_to_safeid: dict[str, str] = {}
@@ -116,18 +114,24 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
 
         self.full_length_enabled = Model.PropertyModel[bool](False)
         self.full_length_enabled.on_value_changed = self._full_length_enabled_changed
+        self.selected_image_axis_index = Model.PropertyModel[int](0)
+        self.selected_image_axis_index.on_value_changed = self._selected_image_axis_changed
         self.status_text = Model.PropertyModel[str]("Select a display panel containing a data item.")
 
         self._ui = Declarative.DeclarativeUI()
         self.ui_view = self._build_ui()
 
         self._coordinate_transforms_stream = self._create_coordinate_transforms_stream()
-        self._coordinate_transforms_listener: EventListenerLike | None = (
-            self._coordinate_transforms_stream.value_stream.listen(self._coordinate_transforms_changed)
-        )
+        self._coordinate_transforms_listener: Event.EventListener | None = (self._coordinate_transforms_stream.value_stream.listen(self._coordinate_transforms_changed))
 
     def _full_length_enabled_changed(self, value: bool | None) -> None:
         """Rebuild visible overlays when the full-length PropertyModel changes."""
+
+        if self._axis_graphics:
+            self._rebuild_existing_axes()
+
+    def _selected_image_axis_changed(self, value: int | None) -> None:
+        """Rebuild visible overlays when the image-axis selection changes."""
 
         if self._axis_graphics:
             self._rebuild_existing_axes()
@@ -216,6 +220,13 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         )
 
         options_row = u.create_row(
+            u.create_label(text="Image axis:", width=60),
+            u.create_combo_box(
+                items=self.image_axis_display_names,
+                current_index="@binding(selected_image_axis_index.value)",
+                width=150
+            ),
+            u.create_spacing(20),
             u.create_check_box(
                 text="Full length lines",
                 checked="@binding(full_length_enabled.value)",
@@ -362,13 +373,18 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         Existing overlay graphics are intentionally preserved.
         """
 
+        current_image_axis_id = self._get_selected_image_axis_id()
+
         self.axis_ids.clear()
+        self.image_axis_ids.clear()
+        self.image_axis_display_names.clear()
         self._axis_id_to_axis.clear()
         self._axis_id_to_safeid.clear()
         self._clear_axis_color_attributes()
         self._clear_axis_toggle_callbacks()
 
         if coordinate_transforms is None:
+            self.selected_image_axis_index.value = 0
             self.status_text.value = "Selected display panel has no readable axes metadata."
             return
 
@@ -376,6 +392,7 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         metadata_source = coordinate_transforms.metadata_source
 
         if not axes:
+            self.selected_image_axis_index.value = 0
             self.status_text.value = "Selected display panel has no readable axes metadata."
             return
 
@@ -409,10 +426,69 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
 
             self._axis_id_to_axis[axis_id] = axis
             self._axis_id_to_safeid[axis_id] = safeid
+            self.image_axis_ids.append(axis_id)
+            self.image_axis_display_names.append(axis.display_name)
 
             setattr(self, f"axis_color_{safeid}", axis.color)
 
+        #This is a workaround having the user select the image axis. In future we would look to have the native axis stored in the metadata and use that as the default or remove this entirely
+        if current_image_axis_id in self.image_axis_ids:
+            self.selected_image_axis_index.value = self.image_axis_ids.index(current_image_axis_id)
+        elif "tv" in self.image_axis_ids:
+            self.selected_image_axis_index.value = self.image_axis_ids.index("tv")
+        else:
+            self.selected_image_axis_index.value = 0
+
         self.status_text.value = f"Loaded {len(self.axis_ids)} axes from {metadata_source}."
+
+    def _get_selected_image_axis_id(self) -> str | None:
+        """Return the currently selected image axis id."""
+
+        if not self.image_axis_ids:
+            return None
+
+        index = self.selected_image_axis_index.value
+
+        if index is not None and 0 <= index < len(self.image_axis_ids):
+            return self.image_axis_ids[index]
+
+        return self.image_axis_ids[0]
+
+    def _get_selected_image_axis(self) -> CoordinateTransform | None:
+        """Return the currently selected image axis transform."""
+
+        image_axis_id = self._get_selected_image_axis_id()
+
+        if image_axis_id is None:
+            return None
+
+        return self._axis_id_to_axis.get(image_axis_id)
+
+    def _vector_in_image_axis(self, vector: Geometry.FloatPoint, image_axis: CoordinateTransform) -> Geometry.FloatPoint | None:
+        """Express a vector in the selected image-axis basis."""
+
+        image_axis_x = image_axis.x_vector
+        image_axis_y = image_axis.y_vector
+        determinant = image_axis_x.y * image_axis_y.x - image_axis_y.y * image_axis_x.x
+
+        if abs(determinant) <= 1e-12:
+            return None
+
+        x_component = (vector.y * image_axis_y.x - image_axis_y.y * vector.x) / determinant
+        y_component = (image_axis_x.y * vector.x - vector.y * image_axis_x.x) / determinant
+
+        return Geometry.FloatPoint(y=y_component, x=x_component)
+
+    def _axis_vectors_in_image_axis(self, axis: CoordinateTransform, image_axis: CoordinateTransform) -> tuple[Geometry.FloatPoint, Geometry.FloatPoint] | None:
+        """Return source-axis basis vectors expressed in image-axis coordinates."""
+
+        x_vector = self._vector_in_image_axis(axis.x_vector, image_axis)
+        y_vector = self._vector_in_image_axis(axis.y_vector, image_axis)
+
+        if x_vector is None or y_vector is None:
+            return None
+
+        return x_vector, y_vector
 
     def _shape_to_height_width(self, shape_value: object) -> tuple[int, int] | None:
         """Convert an xdata value to display height and width."""
@@ -522,12 +598,24 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         """
 
         data_shape = self._get_active_data_shape(graphics_data_item)
+        image_axis = self._get_selected_image_axis()
 
-        x_unit_vector = self._normalize_vector_for_display(axis.x_vector, data_shape)
-        y_unit_vector = self._normalize_vector_for_display(axis.y_vector, data_shape)
+        if image_axis is None:
+            self.status_text.value = "No image axis is selected."
+            return None
+
+        image_axis_vectors = self._axis_vectors_in_image_axis(axis, image_axis)
+
+        if image_axis_vectors is None:
+            self.status_text.value = f"Cannot plot {axis.display_name}: image axis {image_axis.display_name} is singular."
+            return None
+
+        x_vector, y_vector = image_axis_vectors
+        x_unit_vector = self._normalize_vector_for_display(x_vector, data_shape)
+        y_unit_vector = self._normalize_vector_for_display(y_vector, data_shape)
 
         if abs(x_unit_vector) <= 1e-12 or abs(y_unit_vector) <= 1e-12:
-            self.status_text.value = f"Cannot plot {axis.display_name}: metadata vector is near zero."
+            self.status_text.value = f"Cannot plot {axis.display_name}: metadata vector is near zero in {image_axis.display_name}."
             return None
 
         line_length = 0.22
@@ -670,7 +758,9 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
             graphics=graphics
         )
 
-        self.status_text.value = f"Displayed axis {axis.display_name} on active data item."
+        image_axis = self._get_selected_image_axis()
+        image_axis_name = image_axis.display_name if image_axis is not None else "selected image axis"
+        self.status_text.value = f"Displayed axis {axis.display_name} in {image_axis_name} on active data item."
 
     def _remove_graphics_for_key(self, overlay_key: AxisGraphicKey) -> None:
         overlay = self._axis_graphics.pop(overlay_key, None)
@@ -734,7 +824,7 @@ class ExperimentalAxesPlotterPanel(Panel.Panel):
         super().__init__(document_controller, panel_id, PANEL_TITLE)
 
         self.__document_controller = document_controller
-        self.__display_item_changed_listeners: list[EventListenerLike] = []
+        self.__display_item_changed_listeners: list[Event.EventListener] = []
 
         ui = document_controller.ui
 
