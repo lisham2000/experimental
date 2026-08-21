@@ -1,5 +1,10 @@
 """Metadata-driven experimental Axis Plotter panel.
 
+TODO:
+    - Method for storing native image axis in metadata so the user does not have to select it manually and subsequent removal of checkbox
+    - Formalisation of the CoordinateTransforms payload in niondata / metadata so that this panel can consume it directly instead of building it from instrument.axis_transformation_matrices metadata.
+    - Stream/Mode implementation in stem controller opening the ability to track the control being currently updated and being able to impose the control axis automatically instead of having the user select it manually.
+
 Design intent:
 
     - UI / plotting code consumes a CoordinateTransforms payload.
