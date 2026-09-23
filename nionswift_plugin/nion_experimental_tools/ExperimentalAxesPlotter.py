@@ -321,18 +321,30 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         self._axis_toggle_callback_names.clear()
 
     def _get_target_document_window(self) -> Facade.DocumentWindow | None:
-        windows = self._api.application.document_windows
+        """Return a usable facade document window, ignoring transient popup windows."""
 
-        if not windows:
+        try:
+            windows = self._api.application.document_windows
+        except (AttributeError, RuntimeError):
             return None
 
+        fallback_window: Facade.DocumentWindow | None = None
+
         for window in windows:
-            if window.target_display is not None:
+            try:
+                target_display = window.target_display
+                window.target_data_item
+            except (AttributeError, RuntimeError):
+                # Workspace/project changes can temporarily expose PopupWindow objects.
+                continue
+
+            if fallback_window is None:
+                fallback_window = window
+
+            if target_display is not None:
                 return window
 
-        # Prefer a window with an active target display. If none exists, fall back to the
-        # first document window so manual refresh can still work when focus state is not set.
-        return windows[0]
+        return fallback_window
 
     def _get_active_data_item(self) -> Facade.DataItem | None:
         window = self._get_target_document_window()
@@ -340,11 +352,18 @@ class ExperimentalAxesPlotterHandler(Declarative.Handler):
         if window is None:
             return None
 
-        if window.target_data_item is not None:
-            return window.target_data_item
+        try:
+            target_data_item = window.target_data_item
 
-        if window.target_display is not None:
-            return window.target_display.data_item
+            if target_data_item is not None:
+                return target_data_item
+
+            target_display = window.target_display
+
+            if target_display is not None:
+                return target_display.data_item
+        except (AttributeError, RuntimeError):
+            return None
 
         return None
 
@@ -888,7 +907,9 @@ class ExperimentalAxesPlotterPanel(Panel.Panel):
             self.__handler.set_display_item(current_display_item)
             return
 
-        self.__handler.set_display_item(typing.cast(Facade.Display | None, display_item))
+        # None is normal while a workspace or project is closing. Passing it explicitly
+        # prevents the handler from probing transient application popup windows.
+        self.__handler.set_display_item(None)
 
     def close(self) -> None:
         for listener in self.__display_item_changed_listeners:
